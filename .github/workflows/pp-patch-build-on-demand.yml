@@ -1,0 +1,186 @@
+# PP-PATCH :: manual on-demand build, NO FORK REQUIRED
+# =====================================================================
+# 22:25 定案：补丁仓库是一个【普通新建的公开空仓库】，里面只有补丁本身。
+#   不需要 Fork 上游、不需要上游 git 历史、不需要 Sync fork、不需要本地接线。
+#
+# 一次 Run workflow 做的事：
+#   1. checkout 本仓库（只有补丁文件）
+#   2. git ls-remote 找上游最新正式 tag（留空自动；可手填锁旧版；拒绝 main）
+#   3. git clone --depth 1 --branch <tag> 上游到 runner 的临时 upstream/ 目录
+#   4. tools/apply-patch.ps1 把 5 个 .cs 复制进去 + 注入 csproj 5 行 + 3 处钩子
+#      —— 锚点匹配不到就【显式失败】，绝不静默产出退回原版的 dll
+#   5. Patch sentinel 再核一遍
+#   6. setup-dotnet(读 upstream/global.json) -> restore -> build -c Release
+#   7. 上传 ExpressPackingMonitoring.dll + BUILD_INFO.txt
+#
+# 不 publish、不打包、不跑 test、不写回任何仓库、不需要 contents: write。
+# 唯一触发：workflow_dispatch（你点一次跑一次）。
+# 时点提醒：「最新」会漂移，目标机官方更新 → 点 workflow → 替换，连着做完。
+# 2026-11-05
+
+name: pp-patch-build-on-demand
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '可选：留空 = 自动取上游最新正式 tag。只在要锁定旧版时填（如 v0.0.95），不要填 main。'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pp-patch-build
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_URL: https://github.com/PackingProof/PackingProof-Desktop.git
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout patch repo (patch files only, no upstream history needed)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve upstream release tag
+        id: ref
+        shell: pwsh
+        env:
+          UPSTREAM_REF_INPUT: ${{ inputs.upstream_ref }}
+        run: |
+          $raw = @(git ls-remote --tags --refs $env:UPSTREAM_URL)
+          if ($LASTEXITCODE -ne 0) { throw "git ls-remote failed: cannot reach upstream" }
+          $tags = @($raw | ForEach-Object {
+                      $p = $_ -split '\s+'
+                      if ($p.Count -ge 2) { $p[1] -replace '^refs/tags/','' }
+                    } | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' })
+          if ($tags.Count -eq 0) { throw 'No formal release tag (vX.Y.Z) found upstream.' }
+          $sorted = @($tags | Sort-Object -Property @{ Expression = { [version]($_ -replace '^v','') } } -Descending)
+          Write-Host 'Recent upstream release tags:'
+          $sorted | Select-Object -First 10
+
+          $ref = if ($env:UPSTREAM_REF_INPUT) { $env:UPSTREAM_REF_INPUT.Trim() } else { '' }
+          if ([string]::IsNullOrWhiteSpace($ref)) {
+            $ref = $sorted[0]
+            Write-Host "AUTO-RESOLVED latest formal tag: $ref"
+          } else {
+            if ($ref -eq 'main' -or $ref -eq 'master') {
+              throw "Refuse to build from '$ref': development branch, not a released tag."
+            }
+            if ($tags -notcontains $ref) {
+              throw "Tag '$ref' does not exist upstream. Leave upstream_ref empty to auto-pick the latest."
+            }
+            Write-Host "MANUAL upstream_ref: $ref"
+          }
+          "value=$ref" >> $env:GITHUB_OUTPUT
+
+      - name: Clone upstream source at that tag (temp working tree)
+        shell: pwsh
+        env:
+          UPSTREAM_REF: ${{ steps.ref.outputs.value }}
+        run: |
+          git clone --depth 1 --branch $env:UPSTREAM_REF $env:UPSTREAM_URL upstream
+          if ($LASTEXITCODE -ne 0) { throw "clone of $env:UPSTREAM_REF failed" }
+          git -C upstream rev-parse HEAD
+          if (-not (Test-Path upstream/global.json)) { throw 'upstream/global.json missing - setup-dotnet cannot resolve the SDK version' }
+          if (-not (Test-Path upstream/src/ExpressPackingMonitoring/ExpressPackingMonitoring.csproj)) { throw 'upstream csproj missing - upstream layout changed, send this log to the maintainer' }
+
+      - name: Apply patch (copy files + inject csproj lines and hooks)
+        shell: pwsh
+        run: |
+          ./tools/apply-patch.ps1 -UpstreamDir upstream -PatchDir .
+
+      # 哨兵：注入脚本自己已校验一遍，这里独立再查一次，防止脚本被改松。
+      - name: Patch sentinel
+        shell: pwsh
+        run: |
+          $csproj = 'upstream/src/ExpressPackingMonitoring/ExpressPackingMonitoring.csproj'
+          $text = Get-Content $csproj -Raw
+          foreach ($f in @('AppConfig.Patch.cs','DirectCaptureRecordingService.cs',
+                           'ClipByOrderService.cs','MjpegArchiveService.cs','PpPatchRuntime.cs')) {
+            if ($text -notmatch [regex]::Escape($f)) { throw "PATCH LOST: $f missing from csproj" }
+            if (-not (Test-Path "upstream/src/ExpressPackingMonitoring/Services/$f") -and
+                -not (Test-Path "upstream/src/ExpressPackingMonitoring/Config/$f")) {
+              throw "PATCH LOST: source file $f not copied"
+            }
+          }
+          foreach ($f in @('MainViewModel.Camera.cs','MainViewModel.Recording.cs')) {
+            $p = "upstream/src/ExpressPackingMonitoring/ViewModels/$f"
+            if ((Get-Content $p -Raw) -notmatch 'PP-PATCH') {
+              throw "PATCH LOST: PP-PATCH hook missing in $f (would silently fall back to legacy pipeline)"
+            }
+          }
+          Write-Host 'patch sentinel OK'
+
+      - name: Setup .NET (version from upstream global.json)
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: upstream/global.json
+
+      - name: Restore
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem -Filter *.sln | Select-Object -First 1
+          if (-not $sln) { $sln = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1 }
+          if (-not $sln) { throw 'solution not found' }
+          dotnet restore $sln.FullName
+          if ($LASTEXITCODE -ne 0) { throw "restore failed: $LASTEXITCODE" }
+
+      - name: Build Release
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem -Filter *.sln | Select-Object -First 1
+          if (-not $sln) { $sln = Get-ChildItem -Recurse -Filter *.sln | Select-Object -First 1 }
+          dotnet build $sln.FullName -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+
+      - name: Package dll + build info
+        shell: pwsh
+        env:
+          UPSTREAM_REF: ${{ steps.ref.outputs.value }}
+        run: |
+          $dll = Get-ChildItem -Path upstream/src -Recurse -Filter ExpressPackingMonitoring.dll |
+                 Where-Object { $_.FullName -match 'bin[\\/]Release' } | Select-Object -First 1
+          if (-not $dll) { throw 'ExpressPackingMonitoring.dll not found in bin/Release' }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item $dll.FullName out/ExpressPackingMonitoring.dll
+          $hash       = (Get-FileHash out/ExpressPackingMonitoring.dll -Algorithm SHA256).Hash
+          $upSha      = (git -C upstream rev-parse HEAD).Trim()
+          $patchSha   = (git rev-parse HEAD).Trim()
+          $lines = @(
+            "PP-PATCH BUILD (manual / on-demand / fork-free)",
+            "upstream_ref    : $env:UPSTREAM_REF",
+            "upstream_commit : $upSha",
+            "patch_repo_commit: $patchSha",
+            "built_utc       : $([DateTime]::UtcNow.ToString('o'))",
+            "dll_sha256      : $hash",
+            "",
+            "HOW TO DEPLOY:",
+            "  1. Let the target PC finish its OFFICIAL update (it pulls the latest release).",
+            "  2. Right after that, run this workflow with upstream_ref LEFT EMPTY,",
+            "     then close PackingProof and replace app\ExpressPackingMonitoring.dll",
+            "     with this dll. No .bat, no version number to remember.",
+            "  Do the update and the replacement in the SAME SITTING - 'latest' can move",
+            "  if a new release lands in between.",
+            "",
+            "Keep this file for troubleshooting only (send it to the maintainer if it breaks)."
+          )
+          Set-Content -Path out/BUILD_INFO.txt -Value $lines -Encoding UTF8
+          Get-Content out/BUILD_INFO.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pp-patched-dll-${{ steps.ref.outputs.value }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30

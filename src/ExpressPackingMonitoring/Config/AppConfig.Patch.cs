@@ -1,18 +1,55 @@
 #nullable enable
 using System;
 using System.IO;
+using System.Text.Json;
+using ExpressPackingMonitoring.Logging;
 
 namespace ExpressPackingMonitoring.Config
 {
     /// <summary>
-    /// PP-PATCH: patch-only settings.
-    /// This file is NEW and relies on `public partial class AppConfig` (Config/AppConfig.cs:140).
-    /// The original AppConfig.cs is NEVER modified - this is what keeps upstream merges conflict-free.
+    /// PP-PATCH: patch-only settings. This file intentionally declares NO type named
+    /// AppConfig. The real AppConfig lives in the ExpressPackingMonitoring.Core assembly;
+    /// a source-level "partial class AppConfig" here shadows it (CS0436) and breaks every
+    /// `AppConfig.DefaultXxx` constant in the upstream project (CS0117).
+    ///
+    /// Patch settings therefore live in their own static holder. Defaults turn the direct
+    /// pipeline ON as soon as the dll is swapped in; an optional "Patch" section in
+    /// %LOCALAPPDATA%\ExpressPackingMonitoring\config.json can override them:
+    ///
+    ///   { "Patch": { "VideoPipelineMode": "Legacy", "PreviewMode": "Balanced" } }
+    ///
+    /// No upstream file is modified, and no upstream type is referenced.
     /// </summary>
-    public partial class AppConfig
+    public static class PpPatchConfig
     {
-        /// <summary>Direct-pipeline settings. Defaults turn the patch ON after the dll is swapped in.</summary>
-        public PatchOptions Patch { get; set; } = new PatchOptions();
+        private static readonly Lazy<PatchOptions> Holder =
+            new Lazy<PatchOptions>(Load, System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+
+        public static PatchOptions Current => Holder.Value;
+
+        private static PatchOptions Load()
+        {
+            try
+            {
+                var path = Path.Combine(AppPaths.UserDataDir, "config.json");
+                if (!File.Exists(path)) return new PatchOptions();
+
+                using var doc = JsonDocument.Parse(File.ReadAllText(path));
+                if (doc.RootElement.ValueKind != JsonValueKind.Object ||
+                    !doc.RootElement.TryGetProperty("Patch", out var node) ||
+                    node.ValueKind != JsonValueKind.Object)
+                    return new PatchOptions();
+
+                return node.Deserialize<PatchOptions>(
+                           new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                       ?? new PatchOptions();
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Warn("PP-PATCH", "config.json Patch section unreadable, using defaults: " + ex.Message);
+                return new PatchOptions();
+            }
+        }
     }
 
     public sealed class PatchOptions
@@ -64,7 +101,7 @@ namespace ExpressPackingMonitoring.Config
         public string ResolveArchiveFfmpeg() =>
             !string.IsNullOrWhiteSpace(ArchiveFfmpegPath) && File.Exists(ArchiveFfmpegPath)
                 ? ArchiveFfmpegPath
-                : (AppPaths.FindFFmpeg() ?? throw new InvalidOperationException("ffmpeg.exe not found"));
+                : AppPaths.FindFFmpeg();
 
         public (int Width, int Height, int TakeEvery) GetPreviewProfile()
         {

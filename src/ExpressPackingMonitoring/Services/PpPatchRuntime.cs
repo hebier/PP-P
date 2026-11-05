@@ -27,15 +27,14 @@ namespace ExpressPackingMonitoring.Services
             new ConcurrentDictionary<string, DateTimeOffset>(StringComparer.Ordinal);
 
         private static string? _lastOrderNo;
-        private static AppConfig? _config;
         private static DirectCaptureRecordingService? _capture;
         private static ClipByOrderService? _clipper;
         private static MjpegArchiveService? _archive;
         private static Task? _cleanupTask;
         private static CancellationTokenSource? _cleanupCts;
 
-        public static bool DirectEnabled => _config?.Patch?.IsDirect ?? false;
-        public static PatchOptions Settings => _config?.Patch ?? new PatchOptions();
+        public static bool DirectEnabled => PpPatchConfig.Current.IsDirect;
+        public static PatchOptions Settings => PpPatchConfig.Current;
         public static DirectCaptureRecordingService? Capture => _capture;
         public static MjpegArchiveService? Archive => _archive;
 
@@ -46,16 +45,16 @@ namespace ExpressPackingMonitoring.Services
         public static event Action<byte[]>? PreviewFrame;
 
         /// <summary>
-        /// Call from the StartCamera() hook:  PpPatchRuntime.Start(Config);
-        /// Pass the app's own AppConfig instance so config.json keeps controlling the patch.
+        /// Call from the StartCamera() hook:  PpPatchRuntime.Start();
+        /// Settings come from PpPatchConfig (defaults + optional "Patch" section in config.json),
+        /// so no upstream type is needed here.
         /// </summary>
-        public static void Start(AppConfig config)
+        public static void Start()
         {
             lock (Gate)
             {
                 if (_capture != null) return;                 // already running
-                _config = config ?? throw new ArgumentNullException(nameof(config));
-                var opt = config.Patch ?? new PatchOptions();
+                var opt = PpPatchConfig.Current;
 
                 if (!opt.IsDirect)
                 {
@@ -146,7 +145,6 @@ namespace ExpressPackingMonitoring.Services
                 _capture = null;
                 _clipper = null;
                 _archive = null;
-                _config = null;
                 OpenOrders.Clear();
                 RuntimeLog.Info("PP-PATCH", "Direct pipeline stopped");
             }

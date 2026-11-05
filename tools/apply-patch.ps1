@@ -138,7 +138,7 @@ Inject-Hook -File 'ViewModels\MainViewModel.Camera.cs' `
     -Label 'StartCamera' `
     -HookLines @(
         '            // PP-PATCH: direct pipeline hook (keep this marker - CI sentinel checks it)',
-        '            if (Config.Patch?.IsDirect != false) { PpPatchRuntime.Start(Config); return; }'
+        '            if (PpPatchRuntime.DirectEnabled) { PpPatchRuntime.Start(); return; }'
     )
 
 # NOTE: use CurrentOrderId, NOT _recordingOrderId. The latter is only assigned
@@ -174,4 +174,14 @@ foreach ($f in $patchFiles) {
     Assert-True (Test-Path (Join-Path $dstRoot $f)) "VERIFY FAILED: $f not copied"
 }
 
-Write-Host 'PP-PATCH apply-patch OK (5 files + 5 compile lines + 3 hooks)'
+# Regression guard for CI failure CS0436/CS0117 (2026-11-05 first build):
+# the real AppConfig lives in ExpressPackingMonitoring.Core. Declaring a
+# source-level `class AppConfig` here shadows it and breaks every upstream
+# AppConfig.DefaultXxx constant. NEVER reintroduce that type.
+$patchConfig = Read-Raw (Join-Path $dstRoot 'Config\AppConfig.Patch.cs')
+Assert-True ($patchConfig -notmatch '(?m)^\s*(public|internal)\s+(partial\s+)?class\s+AppConfig\b') `
+    'REGRESSION: AppConfig.Patch.cs declares a type named AppConfig again. It shadows the Core type (CS0436) and breaks upstream constants (CS0117).'
+Assert-True ($patchConfig -match 'class\s+PpPatchConfig\b') `
+    'REGRESSION: AppConfig.Patch.cs no longer defines PpPatchConfig.'
+
+Write-Host 'PP-PATCH apply-patch OK (5 files + 5 compile lines + 3 hooks + no AppConfig shadow)'

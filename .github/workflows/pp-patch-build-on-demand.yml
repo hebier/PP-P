@@ -117,6 +117,10 @@ jobs:
               throw "PATCH LOST: PP-PATCH hook missing in $f (would silently fall back to legacy pipeline)"
             }
           }
+          # Regression guard: a source-level `class AppConfig` shadows the Core type (CS0436/CS0117).
+          if ((Get-Content 'upstream/src/ExpressPackingMonitoring/Config/AppConfig.Patch.cs' -Raw) -match '(?m)^\s*(public|internal)\s+(partial\s+)?class\s+AppConfig\b') {
+            throw 'PATCH REGRESSION: AppConfig shadow. Patch settings must live in PpPatchConfig only.'
+          }
           Write-Host 'patch sentinel OK'
 
       - name: Setup .NET (version from upstream global.json)
@@ -148,9 +152,23 @@ jobs:
         env:
           UPSTREAM_REF: ${{ steps.ref.outputs.value }}
         run: |
-          $dll = Get-ChildItem -Path upstream/src -Recurse -Filter ExpressPackingMonitoring.dll |
-                 Where-Object { $_.FullName -match 'bin[\\/]Release' } | Select-Object -First 1
-          if (-not $dll) { throw 'ExpressPackingMonitoring.dll not found in bin/Release' }
+          # The Launcher project ALSO outputs a file named ExpressPackingMonitoring.dll.
+          # A blind recursive search over upstream/src can silently grab that one, which
+          # would produce a dll that cannot be swapped into app\. Restrict to MAIN project.
+          $mainBin = 'upstream/src/ExpressPackingMonitoring/bin/Release'
+          $dll = $null
+          if (Test-Path $mainBin) {
+            $dll = Get-ChildItem -Path $mainBin -Recurse -Filter ExpressPackingMonitoring.dll |
+                   Select-Object -First 1
+          }
+          if (-not $dll) {
+            $dll = Get-ChildItem -Path upstream/src -Recurse -Filter ExpressPackingMonitoring.dll |
+                   Where-Object { $_.FullName -match 'bin[\\/]Release' -and $_.DirectoryName -notmatch 'Launcher' } |
+                   Select-Object -First 1
+            if ($dll) { Write-Host "WARNING: fallback dll lookup used: $($dll.FullName)" }
+          }
+          if (-not $dll) { throw 'MAIN ExpressPackingMonitoring.dll not found in bin/Release' }
+          Write-Host "main dll: $($dll.FullName)"
           New-Item -ItemType Directory -Force -Path out | Out-Null
           Copy-Item $dll.FullName out/ExpressPackingMonitoring.dll
           $hash       = (Get-FileHash out/ExpressPackingMonitoring.dll -Algorithm SHA256).Hash

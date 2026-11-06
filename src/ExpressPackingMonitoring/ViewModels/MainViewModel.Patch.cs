@@ -42,7 +42,29 @@ namespace ExpressPackingMonitoring.ViewModels
         {
             if (Interlocked.Exchange(ref _ppPreviewAttached, 1) != 0) return;
             PpPatchRuntime.PreviewFrame += OnPpPatchPreviewFrame;
+            PpPatchRuntime.OrderClipReady += OnPpPatchOrderClipReady;
+
+            // FFmpeg runs as a child process. Windows does NOT kill child processes when
+            // the parent exits, so without this the camera stays locked after closing the
+            // app and the next launch fails. Both hooks are idempotent (Stop() locks and
+            // disposes once), so registering both is safe.
+            AppDomain.CurrentDomain.ProcessExit += (_, __) => PpPatchRuntime.Stop();
+            if (Application.Current != null)
+                Application.Current.Exit += (_, __) => PpPatchRuntime.Stop();
+
             RuntimeLog.Info("PP-PATCH", "preview attached to VideoFrame");
+        }
+
+        /// <summary>
+        /// A finished per-order clip is written to pp-orders. The upstream DB row is NOT
+        /// created here (InsertVideoRecord needs a live recording session, order snapshot,
+        /// archive path and a matching UpdateVideoRecordOnStop - faking it would corrupt
+        /// the order list). Log the exact path so the clip is always findable, and expose
+        /// the folder via the patch settings tab.
+        /// </summary>
+        private void OnPpPatchOrderClipReady(OrderClipResult clip)
+        {
+            RuntimeLog.Info("PP-PATCH", $"order clip ready: {clip.OrderNo} -> {clip.FilePath}");
         }
 
         private void OnPpPatchPreviewFrame(byte[] jpeg)

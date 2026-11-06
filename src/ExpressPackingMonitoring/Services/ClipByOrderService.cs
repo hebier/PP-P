@@ -84,7 +84,12 @@ namespace ExpressPackingMonitoring.Services
                 if (parts.Count == 0)
                     throw new InvalidOperationException("Order window produced no clip parts");
 
-                string finalPath = Path.Combine(_opt.ResolveOrderClipDir(), SafeFileName(w.OrderNo) + ".mkv");
+                // Include the UTC start time: the same order number can be scanned more than
+                // once (repack / return), and a bare OrderNo.mkv would silently overwrite the
+                // earlier clip - unacceptable for evidence / dispute lookups.
+                string stamp = w.StartUtc.UtcDateTime.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+                string finalPath = Path.Combine(_opt.ResolveOrderClipDir(),
+                    SafeFileName(w.OrderNo) + "_" + stamp + ".mkv");
                 string partialPath = finalPath + ".partial";
                 if (File.Exists(partialPath)) File.Delete(partialPath);
 

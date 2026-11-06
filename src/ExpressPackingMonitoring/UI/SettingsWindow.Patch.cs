@@ -1,5 +1,7 @@
 #nullable enable
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using ExpressPackingMonitoring.Config;
@@ -102,6 +104,37 @@ namespace ExpressPackingMonitoring.UI
                 _ppStatus = MakeNote("");
                 panel.Children.Add(_ppStatus);
                 RefreshStatus();
+
+                // ---- per-order clips ---------------------------------------------
+                panel.Children.Add(MakeSection("按单录像 / Per-order clips"));
+                panel.Children.Add(MakeNote(
+                    "文件名 = 单号_UTC时间.mkv，同一单号重复扫不会覆盖。当前版本不会写进软件的订单列表，" +
+                    "回看请点下面按钮打开文件夹双击播放（VLC 等播放器均可）。\n" +
+                    "Saved as <order>_<UTC time>.mkv; re-scanning the same order never overwrites. " +
+                    "These clips are NOT added to the app's order list yet - use the folder below."));
+
+                var openFolder = new Button
+                {
+                    Content = "打开按单录像文件夹 / Open order clips folder",
+                    Width = 340,
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    Margin = new Thickness(0, 8, 0, 4),
+                    Padding = new Thickness(12, 6, 12, 6)
+                };
+                openFolder.Click += (_, __) =>
+                {
+                    try
+                    {
+                        var dir = PpPatchConfig.Current.ResolveOrderClipDir();
+                        Directory.CreateDirectory(dir);
+                        Process.Start(new ProcessStartInfo("explorer.exe", dir) { UseShellExecute = true });
+                    }
+                    catch (Exception ex)
+                    {
+                        RuntimeLog.Warn("PP-PATCH", "cannot open clips folder: " + ex.Message);
+                    }
+                };
+                panel.Children.Add(openFolder);
 
                 var tab = new TabItem
                 {

@@ -54,27 +54,43 @@ namespace ExpressPackingMonitoring.Services
             lock (Gate)
             {
                 if (_capture != null) return;                 // already running
-                var opt = PpPatchConfig.Current;
-
-                if (!opt.IsDirect)
+                try
                 {
-                    RuntimeLog.Info("PP-PATCH", "Direct pipeline disabled (VideoPipelineMode=Legacy)");
-                    return;
+                    var opt = PpPatchConfig.Current;
+
+                    if (!opt.IsDirect)
+                    {
+                        RuntimeLog.Info("PP-PATCH", "Direct pipeline disabled (VideoPipelineMode=Legacy)");
+                        return;
+                    }
+
+                    Directory.CreateDirectory(opt.ResolveRawSegmentDir());
+                    Directory.CreateDirectory(opt.ResolveOrderClipDir());
+
+                    _capture = new DirectCaptureRecordingService(opt);
+                    _clipper = new ClipByOrderService(opt);
+                    _archive = new MjpegArchiveService(opt);
+
+                    _capture.JpegFrame += OnPreviewFrame;
+                    _capture.Start();
+                    _archive.Start();
+                    StartCleanupLoop(opt);
+
+                    RuntimeLog.Info("PP-PATCH", "PP-PATCH: Direct pipeline active");
                 }
-
-                Directory.CreateDirectory(opt.ResolveRawSegmentDir());
-                Directory.CreateDirectory(opt.ResolveOrderClipDir());
-
-                _capture = new DirectCaptureRecordingService(opt);
-                _clipper = new ClipByOrderService(opt);
-                _archive = new MjpegArchiveService(opt);
-
-                _capture.JpegFrame += OnPreviewFrame;
-                _capture.Start();
-                _archive.Start();
-                StartCleanupLoop(opt);
-
-                RuntimeLog.Info("PP-PATCH", "PP-PATCH: Direct pipeline active");
+                catch (Exception ex)
+                {
+                    // Start() runs at the top of StartCamera(). An unhandled exception here
+                    // would take down the whole window on launch ("app won't open"). Swallow
+                    // it, clean up, and let the app stay usable; the settings tab can switch
+                    // to Legacy. The log line is what we ask for when diagnosing.
+                    RuntimeLog.Error("PP-PATCH", "Direct pipeline failed to start - app stays open, no crash", ex);
+                    try { _capture?.Dispose(); } catch { }
+                    try { _archive?.Dispose(); } catch { }
+                    _capture = null;
+                    _archive = null;
+                    _clipper = null;
+                }
             }
         }
 

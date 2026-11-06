@@ -7,8 +7,10 @@
 #   1. checkout 本仓库（只有补丁文件）
 #   2. git ls-remote 找上游最新正式 tag（留空自动；可手填锁旧版；拒绝 main）
 #   3. git clone --depth 1 --branch <tag> 上游到 runner 的临时 upstream/ 目录
-#   4. tools/apply-patch.ps1 把 5 个 .cs 复制进去 + 注入 csproj 5 行 + 3 处钩子
+#   4. tools/apply-patch.ps1 把 7 个 .cs 复制进去 + 注入 csproj 7 行 + 4 处钩子
 #      —— 锚点匹配不到就【显式失败】，绝不静默产出退回原版的 dll
+#      v3 (2026-11-06): + 预览接线(MainViewModel.Patch.cs) + 设置页签(SettingsWindow.Patch.cs)
+#      两者都在代码里建 UI，不改 XAML / .resx ⇒ 仍只产出一个 dll、无卫星程序集
 #   5. Patch sentinel 再核一遍
 #   6. setup-dotnet(读 upstream/global.json) -> restore -> build -c Release
 #   7. 上传 ExpressPackingMonitoring.dll + BUILD_INFO.txt
@@ -103,20 +105,27 @@ jobs:
         run: |
           $csproj = 'upstream/src/ExpressPackingMonitoring/ExpressPackingMonitoring.csproj'
           $text = Get-Content $csproj -Raw
-          foreach ($f in @('AppConfig.Patch.cs','DirectCaptureRecordingService.cs',
-                           'ClipByOrderService.cs','MjpegArchiveService.cs','PpPatchRuntime.cs')) {
-            if ($text -notmatch [regex]::Escape($f)) { throw "PATCH LOST: $f missing from csproj" }
-            if (-not (Test-Path "upstream/src/ExpressPackingMonitoring/Services/$f") -and
-                -not (Test-Path "upstream/src/ExpressPackingMonitoring/Config/$f")) {
-              throw "PATCH LOST: source file $f not copied"
-            }
-          }
-          foreach ($f in @('MainViewModel.Camera.cs','MainViewModel.Recording.cs')) {
-            $p = "upstream/src/ExpressPackingMonitoring/ViewModels/$f"
-            if ((Get-Content $p -Raw) -notmatch 'PP-PATCH') {
-              throw "PATCH LOST: PP-PATCH hook missing in $f (would silently fall back to legacy pipeline)"
-            }
-          }
+           $dirs = @('Services','Config','ViewModels','UI')
+           foreach ($f in @('AppConfig.Patch.cs','DirectCaptureRecordingService.cs',
+                            'ClipByOrderService.cs','MjpegArchiveService.cs','PpPatchRuntime.cs',
+                            'MainViewModel.Patch.cs','SettingsWindow.Patch.cs')) {
+             if ($text -notmatch [regex]::Escape($f)) { throw "PATCH LOST: $f missing from csproj" }
+             $exists = $false
+             foreach ($d in $dirs) {
+               if (Test-Path "upstream/src/ExpressPackingMonitoring/$d/$f") { $exists = $true; break }
+             }
+             if (-not $exists) { throw "PATCH LOST: source file $f not copied" }
+           }
+           foreach ($f in @('MainViewModel.Camera.cs','MainViewModel.Recording.cs')) {
+             $p = "upstream/src/ExpressPackingMonitoring/ViewModels/$f"
+             if ((Get-Content $p -Raw) -notmatch 'PP-PATCH') {
+               throw "PATCH LOST: PP-PATCH hook missing in $f (would silently fall back to legacy pipeline)"
+             }
+           }
+           $sw = Get-Content 'upstream/src/ExpressPackingMonitoring/UI/SettingsWindow.xaml.cs' -Raw
+           if ($sw -notmatch 'PpPatchInstallSettings\(\)') { throw 'PATCH LOST: settings tab hook missing' }
+           $cam = Get-Content 'upstream/src/ExpressPackingMonitoring/ViewModels/MainViewModel.Camera.cs' -Raw
+           if ($cam -notmatch 'PpPatchAttachPreview\(\)') { throw 'PATCH LOST: preview hook missing (preview would stay black)' }
           # Regression guard: a source-level `class AppConfig` shadows the Core type (CS0436/CS0117).
           if ((Get-Content 'upstream/src/ExpressPackingMonitoring/Config/AppConfig.Patch.cs' -Raw) -match '(?m)^\s*(public|internal)\s+(partial\s+)?class\s+AppConfig\b') {
             throw 'PATCH REGRESSION: AppConfig shadow. Patch settings must live in PpPatchConfig only.'

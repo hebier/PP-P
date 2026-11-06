@@ -13,15 +13,20 @@ namespace ExpressPackingMonitoring.Config
     /// `AppConfig.DefaultXxx` constant in the upstream project (CS0117).
     ///
     /// Patch settings therefore live in their own static holder. Defaults turn the direct
-    /// pipeline ON as soon as the dll is swapped in; an optional "Patch" section in
-    /// %LOCALAPPDATA%\ExpressPackingMonitoring\config.json can override them:
+    /// pipeline ON as soon as the dll is swapped in. Overrides, in priority order:
     ///
-    ///   { "Patch": { "VideoPipelineMode": "Legacy", "PreviewMode": "Balanced" } }
+    ///   1. %LOCALAPPDATA%\ExpressPackingMonitoring\pp-patch.json  (written by the patch
+    ///      settings tab; a plain PatchOptions JSON object)
+    ///   2. a "Patch" section inside the app's config.json (legacy / hand-edited)
     ///
-    /// No upstream file is modified, and no upstream type is referenced.
+    /// The settings tab writes ONLY pp-patch.json, never the app's config.json, so user
+    /// settings can never be damaged. No upstream type is referenced.
     /// </summary>
     public static class PpPatchConfig
     {
+        public static string PatchSettingsPath =>
+            Path.Combine(AppPaths.UserDataDir, "pp-patch.json");
+
         private static readonly Lazy<PatchOptions> Holder =
             new Lazy<PatchOptions>(Load, System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
 
@@ -29,6 +34,23 @@ namespace ExpressPackingMonitoring.Config
 
         private static PatchOptions Load()
         {
+            // 1. patch-owned file (settings tab)
+            try
+            {
+                if (File.Exists(PatchSettingsPath))
+                {
+                    var own = JsonSerializer.Deserialize<PatchOptions>(
+                        File.ReadAllText(PatchSettingsPath),
+                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (own != null) return own;
+                }
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Warn("PP-PATCH", "pp-patch.json unreadable, falling back: " + ex.Message);
+            }
+
+            // 2. optional "Patch" section in the app config (read-only for us)
             try
             {
                 var path = Path.Combine(AppPaths.UserDataDir, "config.json");
@@ -48,6 +70,41 @@ namespace ExpressPackingMonitoring.Config
             {
                 RuntimeLog.Warn("PP-PATCH", "config.json Patch section unreadable, using defaults: " + ex.Message);
                 return new PatchOptions();
+            }
+        }
+
+        /// <summary>
+        /// Mutate the live options object IN PLACE. Services hold a reference to Current,
+        /// so TakeEvery / decode width change on the very next frame without a restart.
+        /// Then persist to pp-patch.json only (never touch the app's config.json).
+        /// </summary>
+        public static void SetPreviewMode(string mode)
+        {
+            Current.PreviewMode = mode;
+            Persist();
+        }
+
+        /// <summary>VideoPipelineMode is read at StartCamera(); a restart is required.</summary>
+        public static void SetPipelineMode(string mode)
+        {
+            Current.VideoPipelineMode = mode;
+            Persist();
+        }
+
+        private static void Persist()
+        {
+            try
+            {
+                var dir = AppPaths.UserDataDir;
+                Directory.CreateDirectory(dir);
+                var json = JsonSerializer.Serialize(Current,
+                    new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(PatchSettingsPath, json);
+                RuntimeLog.Info("PP-PATCH", "saved " + PatchSettingsPath);
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Warn("PP-PATCH", "cannot persist patch settings: " + ex.Message);
             }
         }
     }

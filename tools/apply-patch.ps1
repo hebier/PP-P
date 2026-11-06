@@ -7,10 +7,15 @@ This is the replacement for "fork + git merge". The patch repo contains
 ONLY patch files; the workflow clones upstream at a release tag into a
 temp folder, then calls this script to:
 
-  1. copy the 5 new .cs into the upstream source tree
-  2. inject 5 <Compile Include> lines into the explicit csproj list
-  3. inject 3 entry hooks (each carries a // PP-PATCH marker)
+  1. copy the 7 new .cs into the upstream source tree
+  2. inject 7 <Compile Include> lines into the explicit csproj list
+  3. inject 4 entry hooks (each carries a // PP-PATCH marker)
   4. verify every injection landed
+
+v3 (2026-11-06): + ViewModels/MainViewModel.Patch.cs (preview wiring),
+   + UI/SettingsWindow.Patch.cs (code-built patch settings tab),
+   + SettingsWindow ctor hook. No XAML / .resx are touched, so the build still
+   produces exactly ONE dll to replace and NO satellite resource assemblies.
 
 DESIGN RULE: every anchor is checked. If upstream renamed/restructured a
 method, FAIL LOUDLY. Never "best-effort" inject: a silently misplaced hook
@@ -56,7 +61,9 @@ $patchFiles = @(
     'Services\DirectCaptureRecordingService.cs',
     'Services\ClipByOrderService.cs',
     'Services\MjpegArchiveService.cs',
-    'Services\PpPatchRuntime.cs'
+    'Services\PpPatchRuntime.cs',
+    'ViewModels\MainViewModel.Patch.cs',
+    'UI\SettingsWindow.Patch.cs'
 )
 foreach ($rel in $patchFiles) {
     $from = Join-Path $srcRoot $rel
@@ -86,11 +93,13 @@ $compileLines = @(
     '    <Compile Include="Services\DirectCaptureRecordingService.cs" />',
     '    <Compile Include="Services\ClipByOrderService.cs" />',
     '    <Compile Include="Services\MjpegArchiveService.cs" />',
-    '    <Compile Include="Services\PpPatchRuntime.cs" />'
+    '    <Compile Include="Services\PpPatchRuntime.cs" />',
+    '    <Compile Include="ViewModels\MainViewModel.Patch.cs" />',
+    '    <Compile Include="UI\SettingsWindow.Patch.cs" />'
 )
 $proj = $proj.Insert($anchor.Index, ($compileLines -join $nl) + $nl)
 Write-Raw $csproj $proj
-Write-Host '  csproj  +5 <Compile Include> lines'
+Write-Host '  csproj  +7 <Compile Include> lines'
 
 # --------------------------------------------------------------- 3. hooks
 function Inject-Hook {
@@ -121,6 +130,34 @@ function Inject-Hook {
     Write-Host "  hook    $Label -> $File"
 }
 
+# Some hooks must go after a plain statement rather than a method signature
+# (e.g. InitializeComponent(); in the settings window constructor).
+function Inject-AfterLine {
+    param(
+        [string]   $File,
+        [string]   $LineRegex,
+        [string]   $Label,
+        [string[]] $HookLines
+    )
+    $path = Join-Path $dstRoot $File
+    Assert-True (Test-Path $path) "hook target missing upstream: $File"
+    $raw = Read-Raw $path
+
+    $pattern = '(?m)^[ \t]*' + $LineRegex + '[ \t]*\r?\n'
+    $found = [regex]::Matches($raw, $pattern)
+    if ($found.Count -ne 1) {
+        throw "UPSTREAM CHANGED - LINE ANCHOR NOT UNIQUE: $Label in $File (found $($found.Count))`n" +
+              "Expected exactly one line matching: $LineRegex`n" +
+              'Send this CI log to the maintainer; fix = update the anchor, NOT relax the check.'
+    }
+    $m    = $found[0]
+    $nl2  = Get-Nl $raw
+    $block = ($HookLines -join $nl2) + $nl2
+    $raw   = $raw.Insert($m.Index + $m.Length, $block)
+    Write-Raw $path $raw
+    Write-Host "  hook    $Label -> $File"
+}
+
 # Both files already have `using ExpressPackingMonitoring.Services;` (verified
 # on v0.0.95). Add it only if upstream removed it, so hooks always compile.
 foreach ($f in @('ViewModels\MainViewModel.Camera.cs', 'ViewModels\MainViewModel.Recording.cs')) {
@@ -138,7 +175,7 @@ Inject-Hook -File 'ViewModels\MainViewModel.Camera.cs' `
     -Label 'StartCamera' `
     -HookLines @(
         '            // PP-PATCH: direct pipeline hook (keep this marker - CI sentinel checks it)',
-        '            if (PpPatchRuntime.DirectEnabled) { PpPatchRuntime.Start(); return; }'
+        '            if (PpPatchRuntime.DirectEnabled) { PpPatchRuntime.Start(); PpPatchAttachPreview(); return; }'
     )
 
 # NOTE: use CurrentOrderId, NOT _recordingOrderId. The latter is only assigned
@@ -160,19 +197,42 @@ Inject-Hook -File 'ViewModels\MainViewModel.Recording.cs' `
         '            if (PpPatchRuntime.DirectEnabled) { PpPatchRuntime.EndOrder(); return; }'
     )
 
+# Settings tab is built in code (UI/SettingsWindow.Patch.cs). One line right after
+# InitializeComponent() is enough; no XAML edit and no .resx / satellite assemblies.
+Inject-AfterLine -File 'UI\SettingsWindow.xaml.cs' `
+    -LineRegex 'InitializeComponent\(\);' `
+    -Label 'SettingsWindow ctor' `
+    -HookLines @(
+        '            // PP-PATCH: patch settings tab (keep this marker - CI sentinel checks it)',
+        '            PpPatchInstallSettings();'
+    )
+
 # ------------------------------------------------------------- 4. verify
 $proj = Read-Raw $csproj
 foreach ($f in @('AppConfig.Patch.cs', 'DirectCaptureRecordingService.cs',
-                 'ClipByOrderService.cs', 'MjpegArchiveService.cs', 'PpPatchRuntime.cs')) {
+                 'ClipByOrderService.cs', 'MjpegArchiveService.cs', 'PpPatchRuntime.cs',
+                 'MainViewModel.Patch.cs', 'SettingsWindow.Patch.cs')) {
     Assert-True ($proj -match [regex]::Escape($f)) "VERIFY FAILED: $f missing from csproj"
 }
-foreach ($f in @('ViewModels\MainViewModel.Camera.cs', 'ViewModels\MainViewModel.Recording.cs')) {
+foreach ($f in @('ViewModels\MainViewModel.Camera.cs',
+                 'ViewModels\MainViewModel.Recording.cs',
+                 'UI\SettingsWindow.xaml.cs')) {
     $raw = Read-Raw (Join-Path $dstRoot $f)
     Assert-True ($raw -match 'PP-PATCH') "VERIFY FAILED: no PP-PATCH marker in $f"
 }
 foreach ($f in $patchFiles) {
     Assert-True (Test-Path (Join-Path $dstRoot $f)) "VERIFY FAILED: $f not copied"
 }
+# The preview and settings features must actually be wired, not just compiled in.
+$cameraHook = Read-Raw (Join-Path $dstRoot 'ViewModels\MainViewModel.Camera.cs')
+Assert-True ($cameraHook -match 'PpPatchAttachPreview\(\)') `
+    'VERIFY FAILED: StartCamera hook does not attach the preview (preview would stay black)'
+$settingsHook = Read-Raw (Join-Path $dstRoot 'UI\SettingsWindow.xaml.cs')
+Assert-True ($settingsHook -match 'PpPatchInstallSettings\(\)') `
+    'VERIFY FAILED: settings tab hook missing (no options would appear in Settings)'
+$config = Read-Raw (Join-Path $dstRoot 'Config\AppConfig.Patch.cs')
+Assert-True ($config -match 'SetPreviewMode') `
+    'VERIFY FAILED: PpPatchConfig.SetPreviewMode missing (settings would not take effect)'
 
 # Regression guard for CI failure CS0436/CS0117 (2026-11-05 first build):
 # the real AppConfig lives in ExpressPackingMonitoring.Core. Declaring a
@@ -184,4 +244,4 @@ Assert-True ($patchConfig -notmatch '(?m)^\s*(public|internal)\s+(partial\s+)?cl
 Assert-True ($patchConfig -match 'class\s+PpPatchConfig\b') `
     'REGRESSION: AppConfig.Patch.cs no longer defines PpPatchConfig.'
 
-Write-Host 'PP-PATCH apply-patch OK (5 files + 5 compile lines + 3 hooks + no AppConfig shadow)'
+Write-Host 'PP-PATCH apply-patch OK (7 files + 7 compile lines + 4 hooks + preview/settings wired + no AppConfig shadow)'
